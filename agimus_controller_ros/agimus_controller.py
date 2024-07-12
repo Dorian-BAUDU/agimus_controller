@@ -1,15 +1,21 @@
 import rospy
 import numpy as np
+import os
+import example_robot_data
+
 from copy import deepcopy
 from threading import Lock
 from std_msgs.msg import Duration, Header
 from linear_feedback_controller_msgs.msg import Control, Sensor
+from dynamic_graph_bridge_msgs.msg import Vector
 
 from agimus_controller.utils.ros_np_multiarray import to_multiarray_f64
+from agimus_controller.utils.build_models import get_robot_model, get_collision_model
 from agimus_controller.utils.wrapper_panda import PandaWrapper
 from agimus_controller.mpc import MPC
 from agimus_controller.ocps.ocp_croco_hpp import OCPCrocoHPP
-from agimus_controller.trajectory_point import PointAttribute
+from agimus_controller.trajectory_buffer import TrajectoryBuffer
+from agimus_controller.trajectory_point import TrajectoryPoint, PointAttribute
 
 from agimus_controller_ros.hpp_subscriber import HPPSubscriber
 
@@ -25,8 +31,16 @@ class AgimusControllerNode:
         rospy.loginfo("Load parameters")
         self.params = AgimusControllerNodeParameters()
 
+        robot = example_robot_data.load("panda")
+
         self.pandawrapper = PandaWrapper(auto_col=False)
-        self.rmodel, self.cmodel, self.vmodel = self.pandawrapper.create_robot()
+        current_dir_path = os.path.dirname(os.path.abspath(__file__))
+        urdf_path = os.path.join(current_dir_path, "../urdf/robot.urdf")
+        srdf_path = os.path.join(current_dir_path, "../srdf/demo.srdf")
+        yaml_path = os.path.join(current_dir_path, "../config/param.yaml")
+        self.rmodel = get_robot_model(robot, urdf_path, srdf_path)
+        self.cmodel = get_collision_model(self.rmodel, urdf_path, yaml_path)
+        
         self.ee_frame_name = self.pandawrapper.get_ee_frame_name()
         self.ocp = OCPCrocoHPP(self.rmodel, self.cmodel, use_constraints=False)
         self.ocp.set_weights(10**4, 1, 10**-3, 0)
@@ -59,6 +73,43 @@ class AgimusControllerNode:
         self.first_pose_ref_msg_received = True
         self.point_attributes = [PointAttribute.Q]
 
+        # Creating buffer
+        self.trajbuffer = TrajectoryBuffer()
+        nq = self.rmodel.nq
+        nv = self.rmodel.nv
+        self.point = TrajectoryPoint(nq=nq, nv=nv)
+
+        rospy.loginfo("Spawn the subscribers.")
+        self.subscribers = []
+
+        # q
+        rospy.loginfo("\t- Robot configuration subscriber.")
+        self.subscribers += [
+            rospy.Subscriber(
+                "/hpp/target/position",  # self.params.prefix + "position",
+                Vector,
+                self.position_callback,
+            )
+        ]
+        # v
+        rospy.loginfo("\t- Robot velocity subscriber.")
+        self.subscribers += [
+            rospy.Subscriber(
+                "/hpp/target/velocity",  # self.params.prefix + "velocity",
+                Vector,
+                self.velocity_callback,
+            )
+        ]
+        # a
+        rospy.loginfo("\t- Robot acceleration subscriber.")
+        self.subscribers += [
+            rospy.Subscriber(
+                "/hpp/target/acceleration",  # self.params.prefix + "acceleration",
+                Vector,
+                self.acceleration_callback,
+            )
+        ]
+
     def sensor_callback(self, sensor_msg):
         with self.mutex:
             self.sensor_msg = deepcopy(sensor_msg)
@@ -90,6 +141,32 @@ class AgimusControllerNode:
     # for _ in range(self.params.horizon_size * 2):
     #   tp = self.hpp_subscriber.get_trajectory_point()
     # self.buffer.append
+
+    # point.q = whole_x_plan[traj_idx, :nq]
+    # point.v = whole_x_plan[traj_idx, nq:]
+    # point.a = whole_a_plan[traj_idx, :]
+    # traj_buffer.add_trajectory_point(point)
+
+    def position_callback(self, msg):
+        # Add (msg) to buffer
+        print(msg)
+        self.point.q = msg
+        return 0
+
+    def velocity_callback(self, msg):
+        # Add (msg) to buffer
+        print(msg)
+        self.point.v = msg
+        return 0
+
+    def acceleration_callback(self, msg):
+        # Add (msg) to buffer
+        print(msg)
+        self.point.a = msg
+        return 0
+    
+    def fill_buffer(self):
+        self.trajbuffer.add_trajectory_point(self.point)
 
     def first_solve(self):
         sensor_msg = self.get_sensor_msg()
