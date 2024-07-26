@@ -139,11 +139,14 @@ class OCPCrocoHPP:
         self.a_plan = a_plan
         self.T = x_plan.shape[0]
         self.u_plan = self.get_u_plan(x_plan, a_plan)
-        goal_placement_residual = self.get_placement_residual(
-            self.x_plan[-1, : self.nq]
+        placement_ref = get_ee_pose_from_configuration(
+            self._rmodel,
+            self._rdata,
+            self._last_joint_frame_id,
+            self.x_plan[-1, : self.nq],
         )
         self.set_running_models()
-        self.set_terminal_model(goal_placement_residual)
+        self.set_terminal_model(placement_ref)
 
     def set_running_models(self):
         """Set running models based on state and acceleration reference trajectory."""
@@ -152,17 +155,18 @@ class OCPCrocoHPP:
         for idx in range(self.T - 1):
             running_cost_model = crocoddyl.CostModelSum(self.state)
             x_ref = self.x_plan[idx, :]
-            x_residual = self.get_state_residual(x_ref)
-            u_residual = self.get_control_residual(self.u_plan[idx, :])
-            frame_velocity_residual = self.get_velocity_residual(self._last_joint_name)
-            placemment_residual = self.get_placement_residual(x_ref[: self.nq])
-            running_cost_model.addCost("xReg", x_residual, self._weight_x_reg)
-            running_cost_model.addCost("uReg", u_residual, self._weight_u_reg)
-            running_cost_model.addCost(
-                "velReg", frame_velocity_residual, self._weight_vel_reg
+            x_reg_cost = self.get_state_residual(x_ref)
+            u_reg_cost = self.get_control_residual(self.u_plan[idx, :])
+            vel_reg_cost = self.get_velocity_residual(self._last_joint_name)
+            placement_ref = get_ee_pose_from_configuration(
+                self._rmodel, self._rdata, self._last_joint_frame_id, x_ref[: self.nq]
             )
+            placement_reg_cost = self.get_placement_residual(placement_ref)
+            running_cost_model.addCost("xReg", x_reg_cost, self._weight_x_reg)
+            running_cost_model.addCost("uReg", u_reg_cost, self._weight_u_reg)
+            running_cost_model.addCost("velReg", vel_reg_cost, self._weight_vel_reg)
             running_cost_model.addCost(
-                "gripperPose", placemment_residual, 0
+                "gripperPose", placement_reg_cost, 0
             )  # useful for mpc to reset ocp
 
             if self.use_constraints:
@@ -194,33 +198,34 @@ class OCPCrocoHPP:
                 )
         return constraint_model_manager
 
-    def set_terminal_model(self, goal_placement_residual):
+    def set_terminal_model(self, placement_ref):
         """Set terminal model."""
         if self.use_constraints:
             last_model = self.get_terminal_model_with_constraints(
-                goal_placement_residual, self.x_plan[-1, :], self.u_plan[-1, :]
+                placement_ref, self.x_plan[-1, :], self.u_plan[-1, :]
             )
         else:
             last_model = self.get_terminal_model_without_constraints(
-                goal_placement_residual, self.x_plan[-1, :], self.u_plan[-1, :]
+                placement_ref, self.x_plan[-1, :], self.u_plan[-1, :]
             )
         self.terminal_model = last_model
 
     def get_terminal_model_without_constraints(
-        self, goal_placement_residual, x_ref: np.ndarray, u_plan: np.ndarray
+        self, placement_ref, x_ref: np.ndarray, u_plan: np.ndarray
     ):
         """Return last model without constraints."""
         terminal_cost_model = crocoddyl.CostModelSum(self.state)
+        placement_reg_cost = self.get_placement_residual(placement_ref)
         terminal_cost_model.addCost(
-            "gripperPose", goal_placement_residual, self._weight_ee_placement
+            "gripperPose", placement_reg_cost, self._weight_ee_placement
         )
         vel_cost = self.get_velocity_residual(self._last_joint_name)
         if np.linalg.norm(x_ref[self.nq :]) < 1e-9:
             terminal_cost_model.addCost("velReg", vel_cost, self._weight_ee_placement)
         else:
             terminal_cost_model.addCost("velReg", vel_cost, 0)
-        x_residual = self.get_state_residual(x_ref)
-        terminal_cost_model.addCost("xReg", x_residual, 0)
+        x_reg_cost = self.get_state_residual(x_ref)
+        terminal_cost_model.addCost("xReg", x_reg_cost, 0)
 
         u_reg_cost = self.get_control_residual(u_plan)
         terminal_cost_model.addCost("uReg", u_reg_cost, 0)
@@ -231,16 +236,22 @@ class OCPCrocoHPP:
         return crocoddyl.IntegratedActionModelEuler(terminal_DAM, self.DT)
 
     def get_terminal_model_with_constraints(
-        self, placement_residual, x_ref: np.ndarray, u_plan: np.ndarray
+        self, placement_ref, x_ref: np.ndarray, u_plan: np.ndarray
     ):
         """Return terminal model with constraints for mim_solvers."""
         terminal_cost_model = crocoddyl.CostModelSum(self.state)
-        x_residual = self.get_state_residual(x_ref)
+        placement_reg_cost = self.get_placement_residual(placement_ref)
+        x_reg_cost = self.get_state_residual(x_ref)
         u_reg_cost = self.get_control_residual(u_plan)
         vel_cost = self.get_velocity_residual(self._last_joint_name)
-        terminal_cost_model.addCost("xReg", x_residual, 0)
-        terminal_cost_model.addCost("velReg", vel_cost, 0)
-        terminal_cost_model.addCost("gripperPose", placement_residual, 0)
+        terminal_cost_model.addCost("xReg", x_reg_cost, 0)
+        if np.linalg.norm(x_ref[self.nq :]) < 1e-9:
+            terminal_cost_model.addCost("velReg", vel_cost, self._weight_ee_placement)
+        else:
+            terminal_cost_model.addCost("velReg", vel_cost, 0)
+        terminal_cost_model.addCost(
+            "gripperPose", placement_reg_cost, self._weight_ee_placement
+        )
         terminal_cost_model.addCost("uReg", u_reg_cost, 0)
 
         # Add torque constraint
@@ -277,15 +288,12 @@ class OCPCrocoHPP:
         )
         return constraint
 
-    def get_placement_residual(self, q):
-        """Return placement residual to the last position of the sub path."""
-        target = get_ee_pose_from_configuration(
-            self._rmodel, self._rdata, self._last_joint_frame_id, q
-        )
+    def get_placement_residual(self, placement_ref):
+        """Return placement residual with desired reference for end effector placement."""
         return crocoddyl.CostModelResidual(
             self.state,
             crocoddyl.ResidualModelFramePlacement(
-                self.state, self._last_joint_frame_id, target
+                self.state, self._last_joint_frame_id, placement_ref
             ),
         )
 
@@ -363,7 +371,7 @@ class OCPCrocoHPP:
         self.update_cost(model, new_model, "velReg", update_weight)
         self.update_cost(model, new_model, "uReg", update_weight)
 
-    def reset_ocp(self, x, x_ref: np.ndarray, u_plan: np.ndarray):
+    def reset_ocp(self, x, x_ref: np.ndarray, u_plan: np.ndarray, placement_ref):
         """Reset ocp problem using next reference in state and control."""
         self.solver.problem.x0 = x
         runningModels = list(self.solver.problem.runningModels)
@@ -374,11 +382,11 @@ class OCPCrocoHPP:
         self.update_model(runningModels[-1], self.solver.problem.terminalModel, False)
         if self.use_constraints:
             terminal_model = self.get_terminal_model_with_constraints(
-                self.get_placement_residual(x_ref[: self.nq]), x_ref, u_plan
+                placement_ref, x_ref, u_plan
             )
         else:
             terminal_model = self.get_terminal_model_without_constraints(
-                self.get_placement_residual(x_ref[: self.nq]), x_ref, u_plan
+                placement_ref, x_ref, u_plan
             )
         self.update_model(self.solver.problem.terminalModel, terminal_model, True)
 

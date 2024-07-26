@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import rospy
 import numpy as np
 import os
@@ -18,10 +19,14 @@ from agimus_controller.trajectory_buffer import TrajectoryBuffer
 from agimus_controller.trajectory_point import TrajectoryPoint, PointAttribute
 
 from agimus_controller_ros.hpp_subscriber import HPPSubscriber
+=======
+from agimus_controller_ros.controller_base import ControllerBase
+>>>>>>> a618944a37bbdfdad4b8f2b591e082dd18f05c3e
 
 
-class AgimusControllerNodeParameters:
+class AgimusControllerNode(ControllerBase):
     def __init__(self) -> None:
+<<<<<<< HEAD
         self.rate = rospy.get_param("~rate", 100)
         self.horizon_size = rospy.get_param("~horizon_size", 100)
 
@@ -220,3 +225,6 @@ class AgimusControllerNode:
             self.ocp_solve_time.data = rospy.Time.now() - start_compute_time
             self.ocp_solve_time_pub.publish(self.ocp_solve_time)
             self.rate.sleep()
+=======
+        super().__init__()
+>>>>>>> a618944a37bbdfdad4b8f2b591e082dd18f05c3e

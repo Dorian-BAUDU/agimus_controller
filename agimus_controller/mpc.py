@@ -1,6 +1,8 @@
 from __future__ import annotations
 import numpy as np
 
+from agimus_controller.utils.pin_utils import get_ee_pose_from_configuration
+
 
 class MPC:
     """Create the MPC problem"""
@@ -75,7 +77,13 @@ class MPC:
         for idx in range(1, self.whole_traj_T - 1):
             x_plan = self.update_planning(x_plan, self.whole_x_plan[next_node_idx, :])
             a_plan = self.update_planning(a_plan, self.whole_a_plan[next_node_idx, :])
-            x, u = self.mpc_step(x, x_plan[-1], a_plan[-1])
+            placement_ref = get_ee_pose_from_configuration(
+                self.ocp._rmodel,
+                self.ocp._rdata,
+                self.ocp._last_joint_frame_id,
+                x_plan[-1, : self.nq],
+            )
+            x, u = self.mpc_step(x, x_plan[-1], a_plan[-1], placement_ref)
             if next_node_idx < self.whole_x_plan.shape[0] - 1:
                 next_node_idx += 1
             mpc_xs[idx + 1, :] = x
@@ -116,10 +124,10 @@ class MPC:
         x = self.get_next_state(x0, self.ocp.solver.problem)
         return x, self.ocp.solver.us[0]
 
-    def mpc_step(self, x0, new_x_ref, new_a_ref):
+    def mpc_step(self, x0, new_x_ref, new_a_ref, placement_ref):
         """Reset ocp, run solver and get new state."""
         u_ref_terminal_node = self.ocp.get_inverse_dynamic_control(new_x_ref, new_a_ref)
-        self.ocp.reset_ocp(x0, new_x_ref, u_ref_terminal_node[: self.nq])
+        self.ocp.reset_ocp(x0, new_x_ref, u_ref_terminal_node[: self.nq], placement_ref)
         xs_init = list(self.ocp.solver.xs[1:]) + [self.ocp.solver.xs[-1]]
         xs_init[0] = x0
         us_init = list(self.ocp.solver.us[1:]) + [self.ocp.solver.us[-1]]

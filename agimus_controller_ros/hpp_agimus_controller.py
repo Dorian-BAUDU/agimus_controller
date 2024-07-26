@@ -1,201 +1,40 @@
 #!/usr/bin/env python3
 import rospy
-import numpy as np
-from copy import deepcopy
-import time
-import os
-from threading import Lock
-from std_msgs.msg import Duration, Header
-import example_robot_data
-from linear_feedback_controller_msgs.msg import Control, Sensor
-
-from agimus_controller.utils.ros_np_multiarray import to_multiarray_f64
-from agimus_controller.utils.wrapper_panda import PandaWrapper
-from agimus_controller.utils.build_models import get_robot_model, get_collision_model
+from agimus_controller.trajectory_point import TrajectoryPoint
 from agimus_controller.hpp_interface import HppInterface
-from agimus_controller.mpc import MPC
-from agimus_controller.ocps.ocp_croco_hpp import OCPCrocoHPP
+from agimus_controller_ros.controller_base import ControllerBase
 
 
-class HppAgimusController:
+class HppAgimusController(ControllerBase):
     def __init__(self) -> None:
-        self.dt = 1e-2
+        super().__init__()
         self.q_goal = [-0.8311, 0.6782, 0.3201, -1.1128, 1.2190, 1.9823, 0.7248]
-        self.horizon_size = 100
-
-        robot = example_robot_data.load("panda")
-
-        current_dir_path = os.path.dirname(os.path.abspath(__file__))
-        urdf_path = os.path.join(current_dir_path, "../urdf/robot.urdf")
-        srdf_path = os.path.join(current_dir_path, "../srdf/demo.srdf")
-        yaml_path = os.path.join(current_dir_path, "../config/param.yaml")
-        self.rmodel = get_robot_model(robot, urdf_path, srdf_path)
-        self.cmodel = get_collision_model(self.rmodel, urdf_path, yaml_path)
-        self.pandawrapper = PandaWrapper(auto_col=True)
-        self.ee_frame_name = self.pandawrapper.get_ee_frame_name()
         self.hpp_interface = HppInterface()
-        self.armature = np.array([0.01] * self.rmodel.nq)
-        self.ocp = OCPCrocoHPP(
-            self.rmodel, self.cmodel, use_constraints=False, armature=self.armature
-        )
-        self.ocp.set_weights(10**4, 10, 10**-3, 0)
-        self.mpc_iter = 0
-        self.save_predictions_and_refs = False
+        self.plan_is_set = False
 
-        self.rate = rospy.Rate(100, reset=True)
-        self.mutex = Lock()
-        self.sensor_msg = Sensor()
-        self.control_msg = Control()
-        self.ocp_solve_time = Duration()
-        self.x0 = np.zeros(self.rmodel.nq + self.rmodel.nv)
-        self.x_guess = np.zeros(self.rmodel.nq + self.rmodel.nv)
-        self.u_guess = np.zeros(self.rmodel.nv)
-        self.state_subscriber = rospy.Subscriber(
-            "robot_sensors",
-            Sensor,
-            self.sensor_callback,
-        )
-        self.control_publisher = rospy.Publisher(
-            "motion_server_control", Control, queue_size=1, tcp_nodelay=True
-        )
-        self.ocp_solve_time_pub = rospy.Publisher(
-            "ocp_solve_time", Duration, queue_size=1, tcp_nodelay=True
-        )
-        self.start_time = 0.0
-        self.first_solve = False
-        self.first_robot_sensor_msg_received = False
-        self.first_pose_ref_msg_received = True
+    def get_next_trajectory_point(self):
+        if not self.plan_is_set:
+            self.set_plan()
+            self.plan_is_set = True
+        point = TrajectoryPoint(nq=self.nq, nv=self.nv)
+        point.q = self.whole_x_plan[self.traj_idx, : self.nq]
+        point.v = self.whole_x_plan[self.traj_idx, self.nq :]
+        point.a = self.whole_a_plan[self.traj_idx, :]
+        self.traj_idx = min(self.traj_idx + 1, self.whole_x_plan.shape[0] - 1)
+        return point
 
-    def sensor_callback(self, sensor_msg):
-        with self.mutex:
-            self.sensor_msg = deepcopy(sensor_msg)
-            if not self.first_robot_sensor_msg_received:
-                self.first_robot_sensor_msg_received = True
-
-    def wait_first_sensor_msg(self):
-        wait_for_input = True
-        while not rospy.is_shutdown() and wait_for_input:
-            wait_for_input = (
-                not self.first_robot_sensor_msg_received
-                or not self.first_pose_ref_msg_received
-            )
-            if wait_for_input:
-                rospy.loginfo_throttle(3, "Waiting until we receive a sensor message.")
-                with self.mutex:
-                    sensor_msg = deepcopy(self.sensor_msg)
-                    self.start_time = sensor_msg.header.stamp.to_sec()
-            rospy.loginfo_once("Start controller")
-            self.rate.sleep()
-        return wait_for_input
-
-    def plan_and_first_solve(self):
+    def set_plan(self):
         sensor_msg = self.get_sensor_msg()
-
-        # Plan
         q_init = [*sensor_msg.joint_state.position]
         self.hpp_interface.set_panda_planning(q_init, self.q_goal)
         ps = self.hpp_interface.ps
-        whole_x_plan, whole_a_plan, _ = self.hpp_interface.get_hpp_x_a_planning(
-            self.dt,
-            self.rmodel.nq,
-            ps.client.problem.getPath(ps.numberPaths() - 1),
-        )
-
-        # First solve
-        self.mpc = MPC(self.ocp, whole_x_plan, whole_a_plan, self.rmodel, self.cmodel)
-        self.x_plan = self.mpc.whole_x_plan[: self.horizon_size, :]
-        self.a_plan = self.mpc.whole_a_plan[: self.horizon_size, :]
-        x0 = np.concatenate(
-            [sensor_msg.joint_state.position, sensor_msg.joint_state.velocity]
-        )
-        self.mpc.mpc_first_step(self.x_plan, self.a_plan, x0, self.horizon_size)
-        self.next_node_idx = self.horizon_size
-        whole_traj_T = whole_x_plan.shape[0]
-        if self.save_predictions_and_refs:
-            self.create_predictions_and_refs_arrays(whole_traj_T)
-            self.update_predictions_and_refs_arrays()
-        self.mpc_iter += 1
-
-        _, u, k = self.mpc.get_mpc_output()
-        return sensor_msg, u, k
-
-    def solve(self):
-        sensor_msg = self.get_sensor_msg()
-        x0 = np.concatenate(
-            [sensor_msg.joint_state.position, sensor_msg.joint_state.velocity]
-        )
-
-        new_x_ref = self.mpc.whole_x_plan[self.next_node_idx, :]
-        new_a_ref = self.mpc.whole_a_plan[self.next_node_idx, :]
-
-        mpc_start_time = time.time()
-        self.mpc.mpc_step(x0, new_x_ref, new_a_ref)
-        mpc_duration = time.time() - mpc_start_time
-        rospy.loginfo_throttle(1, "mpc_duration = %s", str(mpc_duration))
-        if self.next_node_idx < self.mpc.whole_x_plan.shape[0] - 1:
-            self.next_node_idx += 1
-        if self.save_predictions_and_refs:
-            self.update_predictions_and_refs_arrays()
-        self.mpc_iter += 1
-        _, u, k = self.mpc.get_mpc_output()
-
-        return sensor_msg, u, k
-
-    def get_sensor_msg(self):
-        with self.mutex:
-            sensor_msg = deepcopy(self.sensor_msg)
-        return sensor_msg
-
-    def send(self, sensor_msg, u, k):
-        self.control_msg.header = Header()
-        self.control_msg.header.stamp = rospy.Time.now()
-        self.control_msg.feedback_gain = to_multiarray_f64(k)
-        self.control_msg.feedforward = to_multiarray_f64(u)
-        self.control_msg.initial_state = sensor_msg
-        self.control_publisher.publish(self.control_msg)
-
-    def update_predictions_and_refs_arrays(self):
-        if self.mpc_iter < self.mpc.whole_x_plan.shape[0]:
-            xs = self.mpc.ocp.solver.xs
-            us = self.mpc.ocp.solver.us
-            x_ref, p_ref, u_ref = self.mpc.get_reference()
-            self.fill_predictions_and_refs_arrays(
-                self.mpc_iter, xs, us, x_ref, p_ref, u_ref
+        self.whole_x_plan, self.whole_a_plan, _ = (
+            self.hpp_interface.get_hpp_x_a_planning(
+                self.dt,
+                self.nq,
+                ps.client.problem.getPath(ps.numberPaths() - 1),
             )
-        if self.mpc_iter == self.mpc.whole_x_plan.shape[0]:
-            np.save("mpc_xs.npy", self.mpc_xs)
-            np.save("mpc_us.npy", self.mpc_us)
-            np.save("state_refs.npy", self.state_refs)
-            np.save("translation_refs.npy", self.translation_refs)
-            np.save("control_refs.npy", self.control_refs)
-
-    def create_predictions_and_refs_arrays(self, whole_traj_T):
-        self.mpc_xs = np.zeros([whole_traj_T, self.horizon_size, 2 * self.rmodel.nq])
-        self.mpc_us = np.zeros([whole_traj_T, self.horizon_size - 1, self.rmodel.nq])
-        self.state_refs = np.zeros([whole_traj_T, 2 * self.rmodel.nq])
-        self.translation_refs = np.zeros([whole_traj_T, 3])
-        self.control_refs = np.zeros([whole_traj_T, self.rmodel.nq])
-
-    def fill_predictions_and_refs_arrays(self, idx, xs, us, x_ref, p_ref, u_ref):
-        self.mpc_xs[idx, :, :] = xs
-        self.mpc_us[idx, :, :] = us
-        self.state_refs[idx, :] = x_ref
-        self.translation_refs[idx, :] = p_ref
-        self.control_refs[idx, :] = u_ref
-
-    def run(self):
-        self.wait_first_sensor_msg()
-        sensor_msg, u, k = self.plan_and_first_solve()
-        input("Press enter to continue ...")
-        self.send(sensor_msg, u, k)
-        self.rate.sleep()
-        while not rospy.is_shutdown():
-            start_compute_time = rospy.Time.now()
-            sensor_msg, u, k = self.solve()
-            self.send(sensor_msg, u, k)
-            self.rate.sleep()
-            self.ocp_solve_time.data = rospy.Time.now() - start_compute_time
-            self.ocp_solve_time_pub.publish(self.ocp_solve_time)
+        )
 
 
 def crocco_motion_server_node():

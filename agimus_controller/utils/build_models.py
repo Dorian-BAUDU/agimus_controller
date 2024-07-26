@@ -2,7 +2,7 @@ import yaml
 import pinocchio as pin
 from hppfcl import Sphere, Box, Cylinder, Capsule
 import numpy as np
-from panda_torque_mpc_pywrap.panda_torque_mpc_pywrap import ReduceCollisionModel
+from panda_torque_mpc_pywrap import reduce_capsules_robot
 
 
 class ObstacleParamsParser:
@@ -126,8 +126,7 @@ def get_robot_model(robot, urdf_path, srdf_path):
 
 def get_collision_model(rmodel, urdf_path, yaml_file):
     collision_model = pin.buildGeomFromUrdf(rmodel, urdf_path, pin.COLLISION)
-    reduce_collision_model = ReduceCollisionModel()
-    collision_model = reduce_collision_model.reduce_capsules_robot(collision_model)
+    collision_model = reduce_capsules_robot(collision_model)
     parser = ObstacleParamsParser(yaml_file, collision_model)
     parser.add_collisions()
     return parser.collision_model
